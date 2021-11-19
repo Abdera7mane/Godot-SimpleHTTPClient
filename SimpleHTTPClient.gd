@@ -16,7 +16,7 @@ var read_chunk_size: int  = 65536
 var requesting: bool
 
 # Sends an HTTP request asynchronously and returns an HTTPResponse object
-# This function is a courotin and you must 'yield()' in order to get the response
+# This function is a coroutine and you must 'yield()' in order to get the response
 #
 # url: the address, specifying the protocol is optional however if a server
 # requires HTTPS then adding "https://" at the start of the url is necessary
