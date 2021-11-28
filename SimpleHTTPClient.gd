@@ -3,6 +3,9 @@
 tool
 class_name SimpleHTTPClient
 
+signal request_completed(response)
+signal body_chunk(chunk, body_size, download_size)
+
 enum {
 	ERR_SSL_HANDSHAKE_ERROR = 49,
 	ERR_NO_RESPONSE,
@@ -11,6 +14,7 @@ enum {
 	ERR_BODY_SIZE_LIMIT_EXCEEDED
 }
 
+var file_path: String
 var http_client: HTTPClient = HTTPClient.new()
 var max_redirects: int = 8
 var read_chunk_size: int = 65536
@@ -35,7 +39,10 @@ func request_async(url: String, headers: PoolStringArray = [], validate_ssl: boo
 		push_error("Already performing an HTTP request")
 		return null
 	var connection: HTTPConenction = HTTPConenction.new()
+	# warning-ignore:return_value_discarded
+	connection.connect("body_chunk", self, "_on_body_chunk")
 	connection.open({
+		file_path = file_path,
 		client = http_client,
 		max_redirects = max_redirects,
 		read_chunk_size = read_chunk_size,
@@ -50,18 +57,27 @@ func request_async(url: String, headers: PoolStringArray = [], validate_ssl: boo
 	var response: Array = yield(connection, "finished")
 	connection.call_deferred("free")
 	requesting = false
-	return HTTPResponse.new(
+	var http_response: HTTPResponse = HTTPResponse.new(
 		response[0],
 		response[1],
 		response[2],
 		response[3]
 	)
+	emit_signal("request_completed", response)
+	return http_response
+
+func _on_body_chunk(chunk: PoolByteArray, body_size: int, download_size: int) -> void:
+	emit_signal("body_chunk", chunk, body_size, download_size)
 
 class HTTPConenction extends Object:
 	
 	signal finished(error, response_code, headers, body)
+	# warning-ignore:unused_signal
+	signal body_chunk(chunk, body_size, download_size)
 	
 	var _thread: Thread
+	
+	var file: File
 	var client: HTTPClient
 	var url: URL
 	var request_path: String
@@ -73,6 +89,7 @@ class HTTPConenction extends Object:
 	var cancelled: bool
 	var response: PoolByteArray
 	var response_headers: PoolStringArray
+	var download_size: int
 	var response_code: int
 	var redirections: int
 	var requesting: bool
@@ -83,6 +100,18 @@ class HTTPConenction extends Object:
 		if requesting:
 			push_error("ALready performing a request")
 			return
+		
+		var error: int
+		
+		var file_path: String = configuration["file_path"]
+		if not file_path.empty():
+			file = File.new()
+			error = file.open(file_path, File.WRITE) 
+			if error != OK:
+				file.close()
+				call_deferred("_close", error, 0, PoolStringArray(), PoolByteArray())
+				return
+		
 		client = configuration["client"]
 		url = configuration["url"]
 		max_redirects = configuration["max_redirects"]
@@ -93,9 +122,9 @@ class HTTPConenction extends Object:
 		client.blocking_mode_enabled = true
 		client.read_chunk_size = configuration["read_chunk_size"]
 		_thread = Thread.new()
-		var error = _thread.start(self, "_connection_loop", configuration)
+		error = _thread.start(self, "_connection_loop", configuration)
 		if error != OK:
-			_close(error, 0, PoolStringArray(), PoolByteArray())
+			call_deferred("_close", error, 0, PoolStringArray(), PoolByteArray())
 			return
 		requesting = true
 	
@@ -105,6 +134,9 @@ class HTTPConenction extends Object:
 			return
 		if _thread.is_active():
 			_thread.wait_to_finish()
+		
+		if file and file.is_open():
+			file.close()
 		
 		response = []
 		response_headers = []
@@ -183,15 +215,25 @@ class HTTPConenction extends Object:
 					return false
 				
 				var chunk: PoolByteArray = client.read_response_body_chunk()
-				if chunk.size() > 0:
-					response.append_array(chunk)
+				var chunk_size: int = chunk.size()
+				if chunk_size > 0:
+					download_size += chunk_size
+					if file:
+						file.store_buffer(chunk)
+						error = file.get_error()
+						if error != OK:
+							call_deferred("_close", error, response_code, response_headers, PoolByteArray())
+							return true
+					else:
+						response.append_array(chunk)
+					call_deferred("emit_signal", "body_chunk", chunk, body_length, download_size)
 				
-				if body_size_limit >= 0 and response.size() > body_length:
+				if body_size_limit >= 0 and download_size > body_length:
 					call_deferred("_close", ERR_BODY_SIZE_LIMIT_EXCEEDED, response_code, response_headers, PoolByteArray())
 					return true
 				
 				if body_length >= 0:
-					if response.size() == body_length:
+					if download_size == body_length:
 						call_deferred("_close", OK, response_code, response_headers, response)
 						return true
 				if client.get_status() == HTTPClient.STATUS_DISCONNECTED:
