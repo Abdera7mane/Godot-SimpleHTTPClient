@@ -13,7 +13,8 @@ enum {
 
 var http_client: HTTPClient = HTTPClient.new()
 var max_redirects: int = 8
-var read_chunk_size: int  = 65536
+var read_chunk_size: int = 65536
+var body_size_limit: int = -1
 var requesting: bool
 
 # Sends an HTTP request asynchronously and returns an HTTPResponse object
@@ -38,6 +39,7 @@ func request_async(url: String, headers: PoolStringArray = [], validate_ssl: boo
 		client = http_client,
 		max_redirects = max_redirects,
 		read_chunk_size = read_chunk_size,
+		body_size_limit = body_size_limit,
 		url = URL.new(url),
 		headers = headers,
 		validate_ssl = validate_ssl,
@@ -65,6 +67,7 @@ class HTTPConenction extends Object:
 	var request_path: String
 	var headers: PoolStringArray
 	var max_redirects: int
+	var body_size_limit
 	var validate_ssl: bool
 
 	var cancelled: bool
@@ -83,6 +86,7 @@ class HTTPConenction extends Object:
 		client = configuration["client"]
 		url = configuration["url"]
 		max_redirects = configuration["max_redirects"]
+		body_size_limit = configuration["body_size_limit"]
 		headers = configuration["headers"]
 		validate_ssl = configuration["validate_ssl"]
 		
@@ -158,24 +162,33 @@ class HTTPConenction extends Object:
 					error = client.request_raw(method, request_path, headers, request_data)
 					request_sent = true
 			HTTPClient.STATUS_BODY:
-				var body_length: int = client.get_response_body_length()
 				if not got_response:
 					var _error: int = _handle_response()
 					if _error != ERR_SKIP:
 						error = _error
 						return error != OK
+
+					var body_length: int = client.get_response_body_length()
 					if not client.is_response_chunked() and body_length == 0:
+						call_deferred("_close", OK, response_code, response_headers, PoolByteArray())
+						return true
+					if body_size_limit >= 0 and body_length > body_size_limit:
 						call_deferred("_close", ERR_BODY_SIZE_LIMIT_EXCEEDED, response_code, response_headers, PoolByteArray())
-						return  true
+						return true
 					
+				var body_length: int = client.get_response_body_length()
 				# warning-ignore:return_value_discarded
 				client.poll()
 				if client.get_status() != HTTPClient.STATUS_BODY:
 					return false
-					
+				
 				var chunk: PoolByteArray = client.read_response_body_chunk()
 				if chunk.size() > 0:
 					response.append_array(chunk)
+				
+				if body_size_limit >= 0 and response.size() > body_length:
+					call_deferred("_close", ERR_BODY_SIZE_LIMIT_EXCEEDED, response_code, response_headers, PoolByteArray())
+					return true
 				
 				if body_length >= 0:
 					if response.size() == body_length:
@@ -184,6 +197,7 @@ class HTTPConenction extends Object:
 				if client.get_status() == HTTPClient.STATUS_DISCONNECTED:
 					call_deferred("_close", OK, response_code, response_headers, response)
 					return true
+				return false
 			HTTPClient.STATUS_CONNECTION_ERROR:
 				error = ERR_CONNECTION_ERROR
 			HTTPClient.STATUS_SSL_HANDSHAKE_ERROR:
