@@ -1,5 +1,6 @@
 # Reference: https://github.com/godotengine/godot/blob/master/scene/main/http_request.cpp
 
+tool
 class_name SimpleHTTPClient
 
 enum {
@@ -26,6 +27,8 @@ var requesting: bool
 # validate_ssl:  weather to check the SSL identity of the host 
 #
 # method: HTTP request method
+
+# body: request's body as a byte array
 func request_async(url: String, headers: PoolStringArray = [], validate_ssl: bool = true, method: int = HTTPClient.METHOD_GET, body: PoolByteArray = []) -> HTTPResponse:
 	if requesting:
 		push_error("Already performing an HTTP request")
@@ -64,6 +67,7 @@ class HTTPConenction extends Object:
 	var max_redirects: int
 	var validate_ssl: bool
 
+	var cancelled: bool
 	var response: PoolByteArray
 	var response_headers: PoolStringArray
 	var response_code: int
@@ -87,11 +91,12 @@ class HTTPConenction extends Object:
 		_thread = Thread.new()
 		var error = _thread.start(self, "_connection_loop", configuration)
 		if error != OK:
+			_close(error, 0, PoolStringArray(), PoolByteArray())
 			return
-		_close(error, 0, PoolStringArray(), PoolByteArray())
 		requesting = true
 	
 	func cancel() -> void:
+		cancelled = true
 		if not requesting:
 			return
 		if _thread.is_active():
@@ -116,7 +121,8 @@ class HTTPConenction extends Object:
 			return
 		
 		request_path = url.get_full_path()
-		while true:
+		
+		while not cancelled:
 			var exit: bool = _update_connection(method, body)
 			if exit:
 				break
@@ -137,8 +143,10 @@ class HTTPConenction extends Object:
 			HTTPClient.STATUS_CONNECTED:
 				if request_sent:
 					if not got_response:
-						error = _handle_response()
-						if error == ERR_SKIP:
+						var _error: int = _handle_response()
+						if _error != ERR_SKIP:
+							error = _error
+						else:
 							call_deferred("_close", OK, response_code, response_headers, PoolByteArray())
 							return true
 					if client.get_response_body_length() < 0:
@@ -150,30 +158,38 @@ class HTTPConenction extends Object:
 					error = client.request_raw(method, request_path, headers, request_data)
 					request_sent = true
 			HTTPClient.STATUS_BODY:
+				var body_length: int = client.get_response_body_length()
 				if not got_response:
-					error = _handle_response()
-					if error == ERR_SKIP:
-						var body_length: int = client.get_response_body_length()
-						if not client.is_response_chunked() and body_length == 0:
-							call_deferred("_close", ERR_BODY_SIZE_LIMIT_EXCEEDED, response_code, response_headers, PoolByteArray())
-							return  true
-						# warning-ignore:return_value_discarded
-						client.poll()
-						var chunk: PoolByteArray = client.read_response_body_chunk()
-						response.append_array(chunk)
-						if body_length >= 0:
-							if response.size() == body_length:
-								call_deferred("_close", OK, response_code, response_headers, response)
-								return true
-						if client.get_status() == HTTPClient.STATUS_DISCONNECTED:
-							call_deferred("_close", OK, response_code, response_headers, response)
-							return true
+					var _error: int = _handle_response()
+					if _error != ERR_SKIP:
+						error = _error
+						return error != OK
+					if not client.is_response_chunked() and body_length == 0:
+						call_deferred("_close", ERR_BODY_SIZE_LIMIT_EXCEEDED, response_code, response_headers, PoolByteArray())
+						return  true
+					
+				# warning-ignore:return_value_discarded
+				client.poll()
+				if client.get_status() != HTTPClient.STATUS_BODY:
+					return false
+					
+				var chunk: PoolByteArray = client.read_response_body_chunk()
+				if chunk.size() > 0:
+					response.append_array(chunk)
+				
+				if body_length >= 0:
+					if response.size() == body_length:
+						call_deferred("_close", OK, response_code, response_headers, response)
+						return true
+				if client.get_status() == HTTPClient.STATUS_DISCONNECTED:
+					call_deferred("_close", OK, response_code, response_headers, response)
+					return true
 			HTTPClient.STATUS_CONNECTION_ERROR:
 				error = ERR_CONNECTION_ERROR
 			HTTPClient.STATUS_SSL_HANDSHAKE_ERROR:
 				error = ERR_SSL_HANDSHAKE_ERROR
 		var exit: bool = error != OK
-		if exit and error != ERR_REDIRECT_LIMIT_REACHED:
+		if exit:
 			call_deferred("_close", error, 0, PoolStringArray(), PoolByteArray())
 		return exit
 	
