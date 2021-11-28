@@ -40,7 +40,7 @@ func get_full_path() -> String:
 		full_path += "?" + query.strip_edges()
 	if not fragment.empty():
 		full_path += "#" + fragment.strip_edges()
-	return full_path
+	return full_path.rstrip("/")
 
 func parse_url(url: String) -> void:
 	url = url.strip_edges()
