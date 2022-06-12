@@ -1,10 +1,14 @@
-# Reference: https://github.com/godotengine/godot/blob/master/scene/main/http_request.cpp
-
 tool
+
+# warning-ignore-all:return_value_discarded
+# warning-ignore-all:unused_signal
+
 class_name SimpleHTTPClient
 
+signal connected()
+signal disconnected()
 signal request_completed(response)
-signal body_chunk(chunk, body_size, download_size)
+signal response_stream(response, chunk)
 
 enum {
 	ERR_SSL_HANDSHAKE_ERROR = 49,
@@ -14,12 +18,31 @@ enum {
 	ERR_BODY_SIZE_LIMIT_EXCEEDED
 }
 
-var file_path: String
-var http_client: HTTPClient = HTTPClient.new()
-var max_redirects: int = 8
-var read_chunk_size: int = 65536
-var body_size_limit: int = -1
+var _connection: HTTPConnection
+
+var http: HTTPClient
+var https: String
 var requesting: bool
+
+var idle_timeout: int    setget set_idle_timeout, get_idle_timeout
+var max_redirects: int   setget set_max_redirects, get_max_redirects
+var body_size_limit: int setget set_body_size_limit, get_body_size_limit
+var stream: bool         setget enable_stream, is_stream_enabled
+var keep_alive: bool
+
+func _init() -> void:
+	http = HTTPClient.new()
+	http.blocking_mode_enabled = true
+	_connection = HTTPConnection.new(http)
+	_connection.connect("connected", self, "_on_connected")
+	_connection.connect("disconnected", self, "_on_disconnected")
+	_connection.connect("response_stream", self, "_on_response_stream")
+
+	self.max_redirects = 8
+	self.body_size_limit = -1
+
+func has_connection() -> bool:
+	return _connection.has_connection()
 
 # Sends an HTTP request asynchronously and returns an HTTPResponse object
 # This function is a coroutine and you must 'yield()' in order to get the response
@@ -27,274 +50,372 @@ var requesting: bool
 # url: the address, specifying the protocol is optional however if a server
 # requires HTTPS then adding "https://" at the start of the url is necessary
 #
-# headers: HTTP request headers
+# headers: a Dictionary of HTTP request headers
 #
-# validate_ssl:  weather to check the SSL identity of the host 
+# validate_ssl: whether to check the SSL identity of the host 
 #
 # method: HTTP request method
-
+#
 # body: request's body as a byte array
-func request_async(url: String, headers: PoolStringArray = [], validate_ssl: bool = true, method: int = HTTPClient.METHOD_GET, body: PoolByteArray = []) -> HTTPResponse:
-	if requesting:
+#
+# Returns an HTTPResponse or null when the instance is already requesting
+func request_async(
+	url: String, headers: Dictionary = {}, validate_ssl: bool = true,
+	method: int = HTTPClient.METHOD_GET, body: PoolByteArray = []
+) -> HTTPResponse:
+	if not requesting:
+		_connection.url = URL.parse_url(url)
+		_connection.set_request({
+			method = method,
+			headers = _dict_headers2array(headers),
+			body = body,
+		})
+		_connection.verify_host = validate_ssl
+	else:
 		push_error("Already performing an HTTP request")
 		return null
-	var connection: HTTPConenction = HTTPConenction.new()
-	# warning-ignore:return_value_discarded
-	connection.connect("body_chunk", self, "_on_body_chunk")
-	connection.open({
-		file_path = file_path,
-		client = http_client,
-		max_redirects = max_redirects,
-		read_chunk_size = read_chunk_size,
-		body_size_limit = body_size_limit,
-		url = URL.new(url),
-		headers = headers,
-		validate_ssl = validate_ssl,
-		method = method,
-		body = body
-	})
+		
 	requesting = true
-	var response: Array = yield(connection, "finished")
-	connection.call_deferred("free")
+	reference()
+	if not has_connection():
+		_connection.start()
+	var response: HTTPResponse = yield(_connection, "request_completed")
+	unreference()
 	requesting = false
-	var http_response: HTTPResponse = HTTPResponse.new(
-		response[0],
-		response[1],
-		response[2],
-		response[3]
-	)
-	emit_signal("request_completed", response)
-	return http_response
-
-func _on_body_chunk(chunk: PoolByteArray, body_size: int, download_size: int) -> void:
-	emit_signal("body_chunk", chunk, body_size, download_size)
-
-class HTTPConenction extends Object:
 	
-	signal finished(error, response_code, headers, body)
-	# warning-ignore:unused_signal
-	signal body_chunk(chunk, body_size, download_size)
+	if not keep_alive:
+		_connection.close()
+	
+	emit_signal("request_completed", response)
+	
+	return response
+
+func set_idle_timeout(value: int) -> void:
+	if _print_error('idle_timeout'):
+		_connection.idle_timeout = value
+
+func set_max_redirects(value: int) -> void:
+	if _print_error('max_redirects'):
+		_connection.max_redirects = value
+
+func set_body_size_limit(value: int) -> void:
+	if _print_error('body_size_limit'):
+		_connection.body_size_limit = value
+
+func enable_stream(value: bool) -> void:
+	if _print_error('stream'):
+		_connection.stream = value
+
+func get_idle_timeout() -> int:
+	return _connection.idle_timeout
+
+func get_max_redirects() -> int:
+	return _connection.max_redirects
+
+func get_body_size_limit() -> int:
+	return _connection.body_size_limit
+
+func is_stream_enabled() -> bool:
+	return _connection.stream
+
+func close() -> void:
+	_connection.close()
+
+func _print_error(property: String) -> bool:
+	if requesting:
+		push_error("Can not set '%s' while requesting" % property)
+		return false
+	return true
+
+func _on_connected() -> void:
+	emit_signal("connected")
+
+func _on_disconnected() -> void:
+	emit_signal("disconnected")
+
+func _on_response_stream(response: HTTPResponse, chunk: PoolByteArray) -> void:
+	call_deferred("emit_signal", "response_stream", response, chunk)
+
+func _notification(what: int) -> void:
+	match what:
+		NOTIFICATION_PREDELETE:
+			_connection.close()
+			_connection.call_deferred("free")
+
+static func _dict_headers2array(headers: Dictionary) -> PoolStringArray:
+	var array: PoolStringArray = []
+	for header in headers:
+		array.append(header + ": " + headers[header])
+	return array
+
+class HTTPConnection extends Object:
+	signal connected()
+	signal disconnected()
+	signal request_completed(response)
+	signal response_stream(response, chunk)
 	
 	var _thread: Thread
+	var _mutex: Mutex
+	var _request: Dictionary setget set_request
+	var _sent_request: bool
+	var _got_response: bool
+	var _reset_response: bool
+	var _skip_body: bool
+	var _responded: bool
+	var _response_length: int
+	var _redirections: int
+	var _next_timeout: int
 	
-	var file: File
-	var client: HTTPClient
-	var url: URL
-	var request_path: String
-	var headers: PoolStringArray
+	var http: HTTPClient
+	var url: Dictionary setget set_url
+	var connected: bool
+	
+	var verify_host: bool
+	var idle_timeout: int
 	var max_redirects: int
-	var body_size_limit
-	var validate_ssl: bool
-
-	var cancelled: bool
-	var response: PoolByteArray
-	var response_headers: PoolStringArray
-	var download_size: int
-	var response_code: int
-	var redirections: int
-	var requesting: bool
-	var request_sent: bool
-	var got_response: bool
-
-	func open(configuration: Dictionary) -> void:
-		if requesting:
-			push_error("ALready performing a request")
-			return
-		
-		var error: int
-		
-		var file_path: String = configuration["file_path"]
-		if not file_path.empty():
-			file = File.new()
-			error = file.open(file_path, File.WRITE) 
-			if error != OK:
-				file.close()
-				call_deferred("_close", error, 0, PoolStringArray(), PoolByteArray())
-				return
-		
-		client = configuration["client"]
-		url = configuration["url"]
-		max_redirects = configuration["max_redirects"]
-		body_size_limit = configuration["body_size_limit"]
-		headers = configuration["headers"]
-		validate_ssl = configuration["validate_ssl"]
-		
-		client.blocking_mode_enabled = true
-		client.read_chunk_size = configuration["read_chunk_size"]
-		_thread = Thread.new()
-		error = _thread.start(self, "_connection_loop", configuration)
-		if error != OK:
-			call_deferred("_close", error, 0, PoolStringArray(), PoolByteArray())
-			return
-		requesting = true
+	var body_size_limit: int
+	var stream: bool
 	
-	func cancel() -> void:
-		cancelled = true
-		if not requesting:
-			return
+	func _init(client: HTTPClient) -> void:
+		_thread = Thread.new()
+		_mutex = Mutex.new()
+		http = client
+	
+	func has_connection() -> bool:
+		return http.get_status() != HTTPClient.STATUS_DISCONNECTED
+	
+	func get_request() -> Dictionary:
+		_mutex.lock()
+		var request: Dictionary = _request
+		_mutex.unlock()
+		return request
+	
+	func get_url() -> Dictionary:
+		_mutex.lock()
+		var _url: Dictionary = url
+		_mutex.unlock()
+		return _url
+	
+	func set_request(data: Dictionary) -> void:
+		_mutex.lock()
+		_request = data
+		_mutex.unlock()
+	
+	func set_url(new_url: Dictionary) -> void:
+		_mutex.lock()
+		var reconnect: bool = URL.must_reconnect(url, new_url)
+		url = new_url
+		_mutex.unlock()
+		
+		if connected and reconnect:
+			_connect(url)
+	
+	func start() -> void:
+		_thread.start(self, "_execute")
+	
+	func close() -> void:
+		url.clear()
+		http.close()
 		if _thread.is_active():
 			_thread.wait_to_finish()
+			_thread = Thread.new()
+		if connected:
+			connected = false
+			call_deferred("emit_signal", "disconnected")
+	
+	func _return_response(response: HTTPResponse) -> void:
+		_responded = true
+		_reset_response = true
+		_sent_request = false
+		_got_response = false
+		_response_length = 0
+		_redirections = 0
 		
-		if file and file.is_open():
-			file.close()
+		_mutex.lock()
+		_request.clear()
+		_mutex.unlock()
 		
-		response = []
-		response_headers = []
-		response_code = 0
-		redirections = 0
-		requesting = false
-		request_sent = false
-		got_response = false
-		client.close()
-
-	func _connection_loop(configuration: Dictionary) -> void:
-		var method = configuration["method"]
-		var body = configuration["body"]
-
-		var error: int = client.connect_to_host(url.host, url.port, url.use_ssl(), validate_ssl)
-		if  error != OK:
-			call_deferred("_close", error, 0, PoolStringArray(), PoolByteArray())
+		if response.body.size() > 0:
+			var compressed: PoolByteArray = response.body
+			var mode: int = -1
+			var buffer_size: int = 0
+			var encoding: String
+			for header in response.headers:
+				if header.to_lower() == "content-encoding":
+					encoding = response.headers[header]
+					break
+			match encoding:
+				"gzip", "x-gzip":
+					mode = File.COMPRESSION_GZIP
+					buffer_size = (compressed[-1] << 24
+								| compressed[-2] << 16
+								| compressed[-3] << 8
+								| compressed[-4])
+			if mode > 0:
+				response.body = compressed.decompress(buffer_size, mode)
+		
+		call_deferred("emit_signal", "request_completed", response)
+	
+	func _stream_chunk(response: HTTPResponse, chunk: PoolByteArray) -> void:
+		call_deferred("emit_signal", "response_stream", response, chunk)
+	
+	func _execute(_data = null) -> void:
+		var response: HTTPResponse = HTTPResponse.new()
+		var error: int = _connect(url)
+		if error != OK:
+			response.error = error
+			_return_response(response)
 			return
+		_connection_loop(response)
 		
-		request_path = url.get_full_path()
-		
-		while not cancelled:
-			var exit: bool = _update_connection(method, body)
-			if exit:
-				break
-			OS.delay_msec(16)
+		if has_connection():
+			call_deferred("close")
 	
-	func _update_connection(method: int, request_data: PoolByteArray) -> bool:
-		var error: int = OK
-		match client.get_status():
-			HTTPClient.STATUS_DISCONNECTED, HTTPClient.STATUS_CANT_CONNECT:
-				error = ERR_CANT_CONNECT
-			HTTPClient.STATUS_RESOLVING,\
-			HTTPClient.STATUS_CONNECTING,\
-			HTTPClient.STATUS_REQUESTING:
-				# warning-ignore:return_value_discarded	
-				client.poll()
+	# warning-ignore:shadowed_variable
+	func _connect(url: Dictionary) -> int:
+		return http.connect_to_host(url.host, url.port, url.use_ssl, verify_host)
+	
+	func _connection_loop(response: HTTPResponse) -> void:
+		while _handle_status(http.get_status(), response):
+			if _reset_response:
+				response = HTTPResponse.new()
+				_reset_response = false
+			OS.delay_msec(1)
+	
+	func _handle_status(status: int, response: HTTPResponse) -> bool:
+		var resume: bool = true
+		match status:
+			HTTPClient.STATUS_DISCONNECTED,\
+			HTTPClient.STATUS_CANT_CONNECT:
+				response.error = ERR_CANT_CONNECT
+				resume = false
 			HTTPClient.STATUS_CANT_RESOLVE:
-				error = ERR_CANT_RESOLVE
-			HTTPClient.STATUS_CONNECTED:
-				if request_sent:
-					if not got_response:
-						var _error: int = _handle_response()
-						if _error != ERR_SKIP:
-							error = _error
-						else:
-							call_deferred("_close", OK, response_code, response_headers, PoolByteArray())
-							return true
-					if client.get_response_body_length() < 0:
-						call_deferred("_close", OK, response_code, response_headers, response)
-						return true
-					call_deferred("_close", ERR_CHUNKED_BODY_SIZE_MISMATCH, response_code, response_headers, PoolByteArray())
-					return true
-				else:
-					error = client.request_raw(method, request_path, headers, request_data)
-					request_sent = true
-			HTTPClient.STATUS_BODY:
-				if not got_response:
-					var _error: int = _handle_response()
-					if _error != ERR_SKIP:
-						error = _error
-						return error != OK
-
-					var body_length: int = client.get_response_body_length()
-					if not client.is_response_chunked() and body_length == 0:
-						call_deferred("_close", OK, response_code, response_headers, PoolByteArray())
-						return true
-					if body_size_limit >= 0 and body_length > body_size_limit:
-						call_deferred("_close", ERR_BODY_SIZE_LIMIT_EXCEEDED, response_code, response_headers, PoolByteArray())
-						return true
-					
-				var body_length: int = client.get_response_body_length()
-				# warning-ignore:return_value_discarded
-				client.poll()
-				if client.get_status() != HTTPClient.STATUS_BODY:
-					return false
-				
-				var chunk: PoolByteArray = client.read_response_body_chunk()
-				var chunk_size: int = chunk.size()
-				if chunk_size > 0:
-					download_size += chunk_size
-					if file:
-						file.store_buffer(chunk)
-						error = file.get_error()
-						if error != OK:
-							call_deferred("_close", error, response_code, response_headers, PoolByteArray())
-							return true
-					else:
-						response.append_array(chunk)
-					call_deferred("emit_signal", "body_chunk", chunk, body_length, download_size)
-				
-				if body_size_limit >= 0 and download_size > body_length:
-					call_deferred("_close", ERR_BODY_SIZE_LIMIT_EXCEEDED, response_code, response_headers, PoolByteArray())
-					return true
-				
-				if body_length >= 0:
-					if download_size == body_length:
-						call_deferred("_close", OK, response_code, response_headers, response)
-						return true
-				if client.get_status() == HTTPClient.STATUS_DISCONNECTED:
-					call_deferred("_close", OK, response_code, response_headers, response)
-					return true
-				return false
+				response.error = ERR_CANT_RESOLVE
+				resume = false
 			HTTPClient.STATUS_CONNECTION_ERROR:
-				error = ERR_CONNECTION_ERROR
+				response.error = ERR_CONNECTION_ERROR
+				resume = false
 			HTTPClient.STATUS_SSL_HANDSHAKE_ERROR:
-				error = ERR_SSL_HANDSHAKE_ERROR
-		var exit: bool = error != OK
-		if exit:
-			call_deferred("_close", error, 0, PoolStringArray(), PoolByteArray())
-		return exit
+				response.error = ERR_SSL_HANDSHAKE_ERROR
+				resume = false
+			HTTPClient.STATUS_CONNECTING,\
+			HTTPClient.STATUS_RESOLVING,\
+			HTTPClient.STATUS_CONNECTED,\
+			HTTPClient.STATUS_REQUESTING,\
+			HTTPClient.STATUS_BODY:
+				http.poll()
+				continue
+			HTTPClient.STATUS_CONNECTED:
+				if not connected:
+					set_deferred("connected", true)
+					call_deferred("emit_signal", "connected")
+				_skip_body = false
+				
+				var request: Dictionary = self._request
+				# warning-ignore:shadowed_variable
+				var url: Dictionary = self.url
+				
+				if not _next_timeout:
+					_next_timeout = OS.get_ticks_msec() + idle_timeout
+				
+				if _sent_request:
+					_next_timeout = 0
+					if not _got_response:
+						response.error = _handle_response(response)
+					
+					if http.get_response_body_length() < 0:
+						_return_response(response)
+					else:
+						response.error = ERR_CHUNKED_BODY_SIZE_MISMATCH
+						_return_response(response)
+					
+				elif not request.empty():
+					_next_timeout = 0
+					http.request_raw(request.method, url.path, request.headers, request.body)
+					_sent_request = true
+					_responded = false
+				
+				
+				resume = not (idle_timeout * _next_timeout > 0 and _next_timeout <= OS.get_ticks_msec())
+			HTTPClient.STATUS_BODY:
+				if not _got_response:
+					response.error = _handle_response(response)
+				response.error = _handle_body(response)
+		
+		if not (resume or _responded):
+			_return_response(response)
+		
+		return resume
 	
-	func _close(error: int, _response_code: int, _headers: PoolStringArray, body: PoolByteArray) -> void:
-		cancel()
-		emit_signal("finished", error, _response_code, _headers, body)
-	
-	func _handle_response() -> int:
-		if not client.has_response():
+	func _handle_response(response: HTTPResponse) -> int:
+		if not http.has_response():
+			_skip_body = true
+			_return_response(response)
 			return ERR_NO_RESPONSE
 		
-		got_response = true
-		response_code = client.get_response_code()
-		response_headers = client.get_response_headers()
-			
-		match response_code:
+		_got_response = true
+		response.code = http.get_response_code()
+		response.headers = http.get_response_headers_as_dictionary()
+		
+		match response.code:
 			HTTPClient.RESPONSE_MOVED_PERMANENTLY, HTTPClient.RESPONSE_FOUND:
-				if max_redirects >= 0 and redirections >= max_redirects:
-					call_deferred("_close", ERR_REDIRECT_LIMIT_REACHED, response_code, response_headers, PoolByteArray())
-					return ERR_REDIRECT_LIMIT_REACHED
-				
-				var redirect_url: String
-				
-				var redirection_header: String = "Location: "
-				for header in response_headers:
-					if header.findn(redirection_header) != -1:
-						redirect_url = header.substr(redirection_header.length() - 1, header.length()).strip_edges()
-						break
-				
-				if not redirect_url.empty():
-					client.close()
-					if redirect_url.begins_with("http"):
-						url.parse_url(redirect_url)
-						request_path = url.get_full_path()
-					else:
-						request_path = redirect_url
-					
-					var error: int = client.connect_to_host(url.host, url.port, url.use_ssl())
-					if error == OK:
-						redirections += 1
-						request_sent = false
-						got_response = false
-						return OK
-		return ERR_SKIP
+				return _handle_redirect(response)
+		
+		return response.error
 	
-	func _notification(what: int) -> void:
-		match what:
-			NOTIFICATION_PREDELETE:
-				if _thread and _thread.is_active():
-					_thread.wait_to_finish()
-				_thread = null
-				url = null
+	func _handle_body(response: HTTPResponse) -> int:
+		if http.get_status() != HTTPClient.STATUS_BODY:
+			return response.error
+		
+		var body_length: int = http.get_response_body_length()
+		var chunk: PoolByteArray = http.read_response_body_chunk()
+		
+		if _skip_body:
+			return response.error
+		
+		var chunk_size: int = chunk.size()
+		if chunk_size > 0:
+			_response_length += chunk_size
+			if stream:
+				_stream_chunk(response, chunk)
+			else:
+				response._append_chunk(chunk)
+		
+		if not http.is_response_chunked() and body_length == 0:
+			_return_response(response)
+		if body_size_limit >= 0 and body_length > body_size_limit:
+			_return_response(response)
+			return ERR_BODY_SIZE_LIMIT_EXCEEDED
+		
+		if body_size_limit >= 0 and _response_length > body_size_limit:
+			_return_response(response)
+			return ERR_BODY_SIZE_LIMIT_EXCEEDED
+		
+		if body_length >= 0 and _response_length == body_length:
+			_return_response(response)
+		return response.error
+	
+	func _handle_redirect(response: HTTPResponse) -> int:
+		var error: int = OK
+		if max_redirects >= 0 and _redirections >= max_redirects:
+			_skip_body = true
+			_return_response(response)
+			return ERR_REDIRECT_LIMIT_REACHED
+		
+		var redirect_url: String = response.get_header("Location")
+		
+		if redirect_url.empty():
+			return error
+		
+		self.url = URL.parse_url(redirect_url)
+		_request.path = url.path
+		
+		
+		_skip_body = true
+		_sent_request = false
+		if error == OK:
+			_redirections += 1
+		else:
+			_return_response(response)
+		
+		return error
